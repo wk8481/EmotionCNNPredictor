@@ -1,190 +1,222 @@
-#
-# Copyright (c) Microsoft. All rights reserved.
-# Licensed under the MIT license. See LICENSE.md file in the project root for full license information.
-#
-
 import sys
-import time
 import os
-import math
 import csv
-import argparse
 import numpy as np
 import logging
+import random as rnd
+from collections import namedtuple
 
-from models import *
-from ferplus import *
+from PIL import Image
+from rect_util import Rect
+import img_util as imgu
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
 
-import cntk as ct
 
-emotion_table = {'neutral'  : 0, 
-                 'happiness': 1, 
-                 'surprise' : 2, 
-                 'sadness'  : 3, 
-                 'anger'    : 4, 
-                 'disgust'  : 5, 
-                 'fear'     : 6, 
-                 'contempt' : 7}
-
-# List of folders for training, validation and test.
-train_folders = ['FER2013Train']
-valid_folders = ['FER2013Valid'] 
-test_folders  = ['FER2013Test']
-
-def cost_func(training_mode, prediction, target):
+def display_summary(train_data_reader, val_data_reader, test_data_reader):
     '''
-    We use cross entropy in most mode, except for the multi-label mode, which require treating
-    multiple labels exactly the same.
+    Summarize the data in a tabular format.
     '''
-    train_loss = None
-    if training_mode == 'majority' or training_mode == 'probability' or training_mode == 'crossentropy': 
-        # Cross Entropy.
-        train_loss = ct.negate(ct.reduce_sum(ct.element_times(target, ct.log(prediction)), axis=-1))
-    elif training_mode == 'multi_target':
-        train_loss = ct.negate(ct.log(ct.reduce_max(ct.element_times(target, prediction), axis=-1)))
+    emotion_count = train_data_reader.emotion_count
+    emotin_header = ['neutral', 'happiness', 'surprise', 'sadness', 'anger', 'disgust', 'fear', 'contempt']
 
-    return train_loss
-    
-def main(base_folder, training_mode='majority', model_name='VGG13', max_epochs = 100):
+    logging.info("{0}\t{1}\t{2}\t{3}".format("".ljust(10), "Train", "Val", "Test"))
+    for index in range(emotion_count):
+        logging.info("{0}\t{1}\t{2}\t{3}".format(emotin_header[index].ljust(10),
+                                                 train_data_reader.per_emotion_count[index],
+                                                 val_data_reader.per_emotion_count[index],
+                                                 test_data_reader.per_emotion_count[index]))
 
-    # create needed folders.
-    output_model_path   = os.path.join(base_folder, R'models')
-    output_model_folder = os.path.join(output_model_path, model_name + '_' + training_mode)
-    if not os.path.exists(output_model_folder):
-        os.makedirs(output_model_folder)
 
-    # creating logging file 
-    logging.basicConfig(filename = os.path.join(output_model_folder, "train.log"), filemode = 'w', level = logging.INFO)
-    logging.getLogger().addHandler(logging.StreamHandler())
+class FERPlusParameters():
+    '''
+    FER+ reader parameters
+    '''
 
-    logging.info("Starting with training mode {} using {} model and max epochs {}.".format(training_mode, model_name, max_epochs))
+    def __init__(self, target_size, width, height, training_mode="majority", determinisitc=False, shuffle=True):
+        self.target_size = target_size
+        self.width = width
+        self.height = height
+        self.training_mode = training_mode
+        self.determinisitc = determinisitc
+        self.shuffle = shuffle
 
-    # create the model
-    num_classes = len(emotion_table)
-    model       = build_model(num_classes, model_name)
 
-    # set the input variables.
-    input_var = ct.input((1, model.input_height, model.input_width), np.float32)
-    label_var = ct.input((num_classes), np.float32)
-    
-    # read FER+ dataset.
-    logging.info("Loading data...")
-    train_params        = FERPlusParameters(num_classes, model.input_height, model.input_width, training_mode, False)
-    test_and_val_params = FERPlusParameters(num_classes, model.input_height, model.input_width, "majority", True)
+class FERPlusReader(Dataset):
+    '''
+    A custom reader for FER+ dataset that support multiple modes as described in:
+        https://arxiv.org/abs/1608.01041
+    '''
 
-    train_data_reader   = FERPlusReader.create(base_folder, train_folders, "label.csv", train_params)
-    val_data_reader     = FERPlusReader.create(base_folder, valid_folders, "label.csv", test_and_val_params)
-    test_data_reader    = FERPlusReader.create(base_folder, test_folders, "label.csv", test_and_val_params)
-    
-    # print summary of the data.
-    display_summary(train_data_reader, val_data_reader, test_data_reader)
-    
-    # get the probalistic output of the model.
-    z    = model.model(input_var)
-    pred = ct.softmax(z)
-    
-    epoch_size     = train_data_reader.size()
-    minibatch_size = 32
+    @classmethod
+    def create(cls, base_folder, sub_folders, label_file_name, parameters):
+        '''
+        Factory function that create an instance of FERPlusReader and load the data form disk.
+        '''
+        reader = cls(base_folder, sub_folders, label_file_name, parameters)
+        reader.load_folders(parameters.training_mode)
+        return reader
 
-    # Training config
-    lr_per_minibatch       = [model.learning_rate]*20 + [model.learning_rate / 2.0]*20 + [model.learning_rate / 10.0]
-    mm_time_constant       = -minibatch_size/np.log(0.9)
-    lr_schedule            = ct.learning_rate_schedule(lr_per_minibatch, unit=ct.UnitType.minibatch, epoch_size=epoch_size)
-    mm_schedule            = ct.momentum_as_time_constant_schedule(mm_time_constant)
+    def __init__(self, base_folder, sub_folders, label_file_name, parameters):
+        '''
+        Each sub_folder contains the image files and a csv file for the corresponding label. The read iterate through
+        all the sub_folders and aggregate all the images and their corresponding labels.        
+        '''
+        self.base_folder = base_folder
+        self.sub_folders = sub_folders
+        self.label_file_name = label_file_name
+        self.emotion_count = parameters.target_size
+        self.width = parameters.width
+        self.height = parameters.height
+        self.shuffle = parameters.shuffle
+        self.training_mode = parameters.training_mode
 
-    # loss and error cost
-    train_loss = cost_func(training_mode, pred, label_var)
-    pe         = ct.classification_error(z, label_var)
+        # data augmentation parameters.determinisitc
+        if parameters.determinisitc:
+            self.max_shift = 0.0
+            self.max_scale = 1.0
+            self.max_angle = 0.0
+            self.max_skew = 0.0
+            self.do_flip = False
+        else:
+            self.max_shift = 0.08
+            self.max_scale = 1.05
+            self.max_angle = 20.0
+            self.max_skew = 0.05
+            self.do_flip = True
 
-    # construct the trainer
-    learner = ct.momentum_sgd(z.parameters, lr_schedule, mm_schedule)
-    trainer = ct.Trainer(z, (train_loss, pe), learner)
+        self.data = None
+        self.per_emotion_count = None
+        self.batch_start = 0
+        self.indices = 0
 
-    # Get minibatches of images to train with and perform model training
-    max_val_accuracy    = 0.0
-    final_test_accuracy = 0.0
-    best_test_accuracy  = 0.0
+        self.A, self.A_pinv = imgu.compute_norm_mat(self.width, self.height)
 
-    logging.info("Start training...")
-    epoch      = 0
-    best_epoch = 0
-    while epoch < max_epochs: 
-        train_data_reader.reset()
-        val_data_reader.reset()
-        test_data_reader.reset()
-        
-        # Training 
-        start_time = time.time()
-        training_loss = 0
-        training_accuracy = 0
-        while train_data_reader.has_more():
-            images, labels, current_batch_size = train_data_reader.next_minibatch(minibatch_size)
+    def __len__(self):
+        return len(self.data)
 
-            # Specify the mapping of input variables in the model to actual minibatch data to be trained with
-            trainer.train_minibatch({input_var : images, label_var : labels})
+    def __getitem__(self, idx):
+        image_path, image_data, emotion, face_rc = self.data[idx]
+        distorted_image = imgu.distort_img(image_data, face_rc, self.width, self.height, self.max_shift, self.max_scale,
+                                           self.max_angle, self.max_skew, self.do_flip)
+        final_image = imgu.preproc_img(distorted_image, A=self.A, A_pinv=self.A_pinv)
+        final_image = np.expand_dims(final_image, axis=0)  # Add channel dimension
+        return torch.tensor(final_image, dtype=torch.float32), torch.tensor(emotion, dtype=torch.float32)
 
-            # keep track of statistics.
-            training_loss     += trainer.previous_minibatch_loss_average * current_batch_size
-            training_accuracy += trainer.previous_minibatch_evaluation_average * current_batch_size
-                
-        training_accuracy /= train_data_reader.size()
-        training_accuracy = 1.0 - training_accuracy
-        
-        # Validation
-        val_accuracy = 0
-        while val_data_reader.has_more():
-            images, labels, current_batch_size = val_data_reader.next_minibatch(minibatch_size)
-            val_accuracy += trainer.test_minibatch({input_var : images, label_var : labels}) * current_batch_size
-            
-        val_accuracy /= val_data_reader.size()
-        val_accuracy = 1.0 - val_accuracy
-        
-        # if validation accuracy goes higher, we compute test accuracy
-        test_run = False
-        if val_accuracy > max_val_accuracy:
-            best_epoch = epoch
-            max_val_accuracy = val_accuracy
+    def load_folders(self, mode):
+        '''
+        Load the actual images from disk. While loading, we normalize the input data.
+        '''
+        self.reset()
+        self.data = []
+        self.per_emotion_count = np.zeros(self.emotion_count, dtype=np.int)
 
-            trainer.save_checkpoint(os.path.join(output_model_folder, "model_{}".format(best_epoch)))
+        for folder_name in self.sub_folders:
+            logging.info("Loading %s" % (os.path.join(self.base_folder, folder_name)))
+            folder_path = os.path.join(self.base_folder, folder_name)
+            in_label_path = os.path.join(folder_path, self.label_file_name)
+            with open(in_label_path) as csvfile:
+                emotion_label = csv.reader(csvfile)
+                for row in emotion_label:
+                    # load the image
+                    image_path = os.path.join(folder_path, row[0])
+                    image_data = Image.open(image_path)
+                    image_data.load()
 
-            test_run = True
-            test_accuracy = 0
-            while test_data_reader.has_more():
-                images, labels, current_batch_size = test_data_reader.next_minibatch(minibatch_size)
-                test_accuracy += trainer.test_minibatch({input_var : images, label_var : labels}) * current_batch_size
-            
-            test_accuracy /= test_data_reader.size()
-            test_accuracy = 1.0 - test_accuracy
-            final_test_accuracy = test_accuracy
-            if final_test_accuracy > best_test_accuracy: 
-                best_test_accuracy = final_test_accuracy
- 
-        logging.info("Epoch {}: took {:.3f}s".format(epoch, time.time() - start_time))
-        logging.info("  training loss:\t{:e}".format(training_loss))
-        logging.info("  training accuracy:\t\t{:.2f} %".format(training_accuracy * 100))
-        logging.info("  validation accuracy:\t\t{:.2f} %".format(val_accuracy * 100))
-        if test_run:
-            logging.info("  test accuracy:\t\t{:.2f} %".format(test_accuracy * 100))
-            
-        epoch += 1
+                    # face rectangle 
+                    box = list(map(int, row[1][1:-1].split(',')))
+                    face_rc = Rect(box)
 
-    logging.info("")
-    logging.info("Best validation accuracy:\t\t{:.2f} %, epoch {}".format(max_val_accuracy * 100, best_epoch))
-    logging.info("Test accuracy corresponding to best validation:\t\t{:.2f} %".format(final_test_accuracy * 100))
-    logging.info("Best test accuracy:\t\t{:.2f} %".format(best_test_accuracy * 100))
-    
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", 
-                        "--base_folder", 
-                        type = str, 
-                        help = "Base folder containing the training, validation and testing data.", 
-                        required = True)
-    parser.add_argument("-m", 
-                        "--training_mode", 
-                        type = str,
-                        default='majority',
-                        help = "Specify the training mode: majority, probability, crossentropy or multi_target.")
+                    emotion_raw = list(map(float, row[2:len(row)]))
+                    emotion = self._process_data(emotion_raw, mode)
+                    idx = np.argmax(emotion)
+                    if idx < self.emotion_count:  # not unknown or non-face
+                        emotion = emotion[:-2]
+                        emotion = [float(i) / sum(emotion) for i in emotion]
+                        self.data.append((image_path, image_data, emotion, face_rc))
+                        self.per_emotion_count[idx] += 1
 
-    args = parser.parse_args()
-    main(args.base_folder, args.training_mode)
+        self.indices = np.arange(len(self.data))
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+
+    def _process_target(self, target):
+        '''
+        Based on https://arxiv.org/abs/1608.01041 the target depend on the training mode.
+
+        Majority or crossentropy: return the probability distribution generated by "_process_data"
+        Probability: pick one emotion based on the probability distribtuion.
+        Multi-target: 
+        '''
+        if self.training_mode == 'majority' or self.training_mode == 'crossentropy':
+            return target
+        elif self.training_mode == 'probability':
+            idx = np.random.choice(len(target), p=target)
+            new_target = np.zeros_like(target)
+            new_target[idx] = 1.0
+            return new_target
+        elif self.training_mode == 'multi_target':
+            new_target = np.array(target)
+            new_target[new_target > 0] = 1.0
+            epsilon = 0.001  # add small epsilon in order to avoid ill-conditioned computation
+            return (1 - epsilon) * new_target + epsilon * np.ones_like(target)
+
+    def _process_data(self, emotion_raw, mode):
+        '''
+        Based on https://arxiv.org/abs/1608.01041, we process the data differently depend on the training mode:
+
+        Majority: return the emotion that has the majority vote, or unknown if the count is too little.
+        Probability or Crossentropty: convert the count into probability distribution.abs
+        Multi-target: treat all emotion with 30% or more votes as equal.
+        '''
+        size = len(emotion_raw)
+        emotion_unknown = [0.0] * size
+        emotion_unknown[-2] = 1.0
+
+        # remove emotions with a single vote (outlier removal) 
+        for i in range(size):
+            if emotion_raw[i] < 1.0 + sys.float_info.epsilon:
+                emotion_raw[i] = 0.0
+
+        sum_list = sum(emotion_raw)
+        emotion = [0.0] * size
+
+        if mode == 'majority':
+            # find the peak value of the emo_raw list 
+            maxval = max(emotion_raw)
+            if maxval > 0.5 * sum_list:
+                emotion[np.argmax(emotion_raw)] = maxval
+            else:
+                emotion = emotion_unknown  # force setting as unknown
+        elif (mode == 'probability') or (mode == 'crossentropy'):
+            sum_part = 0
+            count = 0
+            valid_emotion = True
+            while sum_part < 0.75 * sum_list and count < 3 and valid_emotion:
+                maxval = max(emotion_raw)
+                for i in range(size):
+                    if emotion_raw[i] == maxval:
+                        emotion[i] = maxval
+                        emotion_raw[i] = 0
+                        sum_part += emotion[i]
+                        count += 1
+                        if i >= 8:  # unknown or non-face share same number of max votes 
+                            valid_emotion = False
+                            if sum(emotion) > maxval:  # there have been other emotions ahead of unknown or non-face
+                                emotion[i] = 0
+                                count -= 1
+                            break
+            if sum(emotion) <= 0.5 * sum_list or count > 3:  # less than 50% of the votes are integrated, or there are too many emotions, we'd better discard this example
+                emotion = emotion_unknown  # force setting as unknown
+        elif mode == 'multi_target':
+            threshold = 0.3
+            for i in range(size):
+                if emotion_raw[i] >= threshold * sum_list:
+                    emotion[i] = emotion_raw[i]
+            if sum(emotion) <= 0.5 * sum_list:  # less than 50% of the votes are integrated, we discard this example
+                emotion = emotion_unknown  # set as unknown
+
+        return [float(i) / sum(emotion) for i in emotion]
